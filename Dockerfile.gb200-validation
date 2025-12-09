@@ -50,7 +50,7 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=128
 WORKDIR /workspace
 
 # Cache-busting ARG for script download layer
-ARG SCRIPT_VERSION=v5
+ARG SCRIPT_VERSION=v7
 ENV SCRIPT_VERSION=${SCRIPT_VERSION}
 
 # Clone and build FlashMLA from sm100-validation branch

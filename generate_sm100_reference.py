@@ -140,10 +140,32 @@ def generate_test_data(config):
         # Decode mode: Q is (b, s_q, h_q, d_qk)
         Q = torch.randn(b, s_q, h_q, d_qk, dtype=torch.bfloat16, device='cuda') * 0.1
 
-        # KV cache: (num_blocks, block_size, h_kv, d_qk)
+        # KV cache: PACKED format (num_blocks, block_size, h_kv, 656 bytes)
+        # 656 = 512 (FP8 nope) + 16 (4 FP32 scales) + 128 (64 BF16 rope)
         num_blocks = config.get('num_blocks', 32)
         block_size = config.get('block_size', 64)
-        KV = torch.randn(num_blocks, block_size, h_kv, d_qk, dtype=torch.bfloat16, device='cuda') * 0.1
+
+        # Generate raw data
+        nope_data = torch.randn(num_blocks, block_size, h_kv, 512, dtype=torch.bfloat16, device='cuda') * 0.1
+        rope_data = torch.randn(num_blocks, block_size, h_kv, 64, dtype=torch.bfloat16, device='cuda') * 0.1
+
+        # Quantize nope to FP8
+        nope_fp8 = torch.clamp(nope_data / 0.01, -448, 448).to(torch.float8_e4m3fn)
+
+        # Create scales (4 per token, one per 128-element block)
+        scales = torch.full((num_blocks, block_size, h_kv, 4), 0.01, dtype=torch.float32, device='cuda')
+
+        # Pack into bytes: FP8(512) + FP32(4) + BF16(64) = 512 + 16 + 128 = 656 bytes
+        KV = torch.zeros(num_blocks, block_size, h_kv, 656, dtype=torch.uint8, device='cuda')
+
+        # Pack FP8 nope (512 bytes)
+        KV[:, :, :, :512] = nope_fp8.view(num_blocks, block_size, h_kv, 512).view(torch.uint8)
+
+        # Pack scales (16 bytes)
+        KV[:, :, :, 512:528] = scales.view(num_blocks, block_size, h_kv, 16).view(torch.uint8)
+
+        # Pack BF16 rope (128 bytes)
+        KV[:, :, :, 528:656] = rope_data.view(num_blocks, block_size, h_kv, 128).view(torch.uint8)
 
         # Generate sparse indices based on pattern
         indices = torch.zeros(b, s_q, topk, dtype=torch.int32, device='cuda')
@@ -199,26 +221,11 @@ def test_flashmla_decode(config):
     except Exception as e:
         return {'error': f'Failed to load FlashMLA: {e}'}
 
-    # Generate test data
+    # Generate test data (KV is already packed uint8 format for decode)
     data = generate_test_data(config)
 
-    # Handle precision configuration
-    precision = config.get('precision', 'fp8')
-    if precision == 'bf16':
-        # BF16 path: keep KV as-is, use dummy scale
-        KV_fp8 = data['KV'].to(torch.float8_e4m3fn)  # Cast for API compatibility
-        scale = 1.0
-    elif precision == 'fp8':
-        # FP8 path: quantize with specified or computed scale
-        if 'fp8_scale' in config:
-            scale = config['fp8_scale']
-            scaled = data['KV'] / scale
-            KV_fp8 = torch.clamp(scaled, -448.0, 448.0).to(torch.float8_e4m3fn)
-        else:
-            KV_fp8, scale = quantize_fp8(data['KV'])
-    else:
-        # Default to FP8
-        KV_fp8, scale = quantize_fp8(data['KV'])
+    # KV cache is already in packed FP8 format (uint8), use as-is
+    KV_packed = data['KV']
 
     # Get metadata
     b = config['batch_size']
@@ -252,7 +259,7 @@ def test_flashmla_decode(config):
             start = time.time()
             result = fwd_kvcache_mla(
                 data['Q'],              # [b, s_q, h_q, d]
-                KV_fp8,                 # [num_blocks, block_size, h_kv, d]
+                KV_packed,              # [num_blocks, block_size, h_kv, 656] packed uint8
                 d_v,                    # int: head_size_v
                 cache_seqlens,          # [b]: seqlens_k
                 data['block_table'],    # [b, max_blocks]
