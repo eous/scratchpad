@@ -59,7 +59,7 @@ RUN git clone --recursive -b sm100-validation https://github.com/eous/DeepGEMM.g
     echo "DeepGEMM build complete"
 
 # Download validation script from scratchpad
-# Version: v4 (topk=128/256, head_dim_qk=576, s_kv>=topk)
+# Version: v5 (topk%128==0, head_dim_qk=576, s_kv>=topk, num_heads_q%64==0)
 RUN wget https://raw.githubusercontent.com/eous/scratchpad/main/generate_sm100_reference.py -O /workspace/generate_sm100_reference.py && \
     chmod +x /workspace/generate_sm100_reference.py
 

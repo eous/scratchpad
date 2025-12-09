@@ -498,12 +498,12 @@ def main():
         ]
 
         prefill_configs = [
-            # Small: single batch, few queries (topk must be multiple of 128 for SM90, s_kv must be >= topk)
-            {'name': 'small_single', 'batch_size': 1, 's_q': 4, 's_kv': 256, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 128, 'mode': 'prefill'},
+            # Small: single batch, few queries (topk % 128 == 0, s_kv >= topk, num_heads_q % 64 == 0 for SM90)
+            {'name': 'small_single', 'batch_size': 1, 's_q': 4, 's_kv': 256, 'num_heads_q': 64, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 128, 'mode': 'prefill'},
             # Medium: multi-batch
-            {'name': 'medium_multi', 'batch_size': 4, 's_q': 8, 's_kv': 512, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 256, 'mode': 'prefill'},
+            {'name': 'medium_multi', 'batch_size': 4, 's_q': 8, 's_kv': 512, 'num_heads_q': 64, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 256, 'mode': 'prefill'},
             # Long sequence
-            {'name': 'long_seq', 'batch_size': 1, 's_q': 4, 's_kv': 2048, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 384, 'mode': 'prefill'},
+            {'name': 'long_seq', 'batch_size': 1, 's_q': 4, 's_kv': 2048, 'num_heads_q': 128, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 384, 'mode': 'prefill'},
         ]
 
         deepgemm_configs = [
