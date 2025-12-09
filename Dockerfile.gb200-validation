@@ -52,8 +52,8 @@ RUN git clone --recursive -b sm100-validation https://github.com/eous/FlashMLA.g
     pip3 install --no-build-isolation -e . && \
     echo "FlashMLA build complete"
 
-# Clone and build DeepGEMM from official fork (with cutlass and fmt submodules)
-RUN git clone --recursive https://github.com/eous/DeepGEMM.git && \
+# Clone and build DeepGEMM from sm100-validation branch
+RUN git clone --recursive -b sm100-validation https://github.com/eous/DeepGEMM.git && \
     cd DeepGEMM && \
     DG_USE_LOCAL_VERSION=1 DG_FORCE_BUILD=1 pip3 install --no-build-isolation . && \
     echo "DeepGEMM build complete"

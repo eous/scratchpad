@@ -30,6 +30,15 @@ import hashlib
 import traceback
 from pathlib import Path
 
+# Load FlashMLA torch ops (required for torch.ops._flashmla_C to work)
+# The TORCH_LIBRARY registration only runs when the module is imported
+try:
+    import _flashmla_C  # noqa: F401
+    import _flashmla_extension_C  # noqa: F401
+except ImportError as e:
+    print(f"Warning: Could not import FlashMLA extensions: {e}")
+    print("FlashMLA tests will fail. Make sure FlashMLA is built correctly.")
+
 # Fixed random seed for reproducibility across SM100/SM120
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
@@ -214,44 +223,51 @@ def test_flashmla_decode(config):
     # Get metadata
     b = config['batch_size']
     s_q = config.get('s_q', 1)
+    h_q = config['num_heads_q']
+    h_kv = config.get('num_heads_kv', 1)
+    d_v = config['head_dim_v']
+    d_qk = config['head_dim_qk']
     topk = config['topk']
 
     with torch.no_grad():
         try:
-            cache_lens = torch.full((b,), 4096, dtype=torch.int32, device='cuda')
+            # Prepare metadata call
+            cache_seqlens = torch.full((b,), 4096, dtype=torch.int32, device='cuda')
+            num_q_tokens_per_head_k = s_q * h_q // h_kv
+
+            # Get metadata - returns [tile_scheduler_metadata, num_splits]
             metadata = get_mla_metadata(
-                b, s_q, topk,
-                cache_lens,
-                64,  # block_size
-                0,   # fixed_overhead
-                1    # num_sm_parts
+                cache_seqlens,          # Tensor: seqlens_k
+                num_q_tokens_per_head_k,  # int
+                h_kv,                   # int: h_k
+                h_q,                    # int: h_q
+                True,                   # bool: is_fp8_kvcache
+                topk                    # int: topk
             )
+            tile_scheduler_metadata = metadata[0]
+            num_splits = metadata[1]
 
-            # Run kernel
-            output = torch.zeros(
-                b, s_q, config['num_heads_q'], config['head_dim_v'],
-                dtype=torch.bfloat16, device='cuda'
-            )
-            lse = torch.zeros(
-                b, s_q, config['num_heads_q'],
-                dtype=torch.float32, device='cuda'
-            )
-
+            # Run kernel - returns [output, lse]
             torch.cuda.synchronize()  # Ensure previous ops complete
             start = time.time()
-            fwd_kvcache_mla(
-                data['Q'], KV_fp8, data['indices'], data['block_table'],
-                output, lse,
-                metadata['tile_scheduler_metadata'],
-                metadata['num_splits'],
-                metadata['total_num_splits'],
-                None, None,  # split accumulators
-                scale, scale,
-                0.08838834764831845,  # sm_scale for d_qk=128
-                0.08838834764831845 / np.log(2),  # sm_scale_log2
+            result = fwd_kvcache_mla(
+                data['Q'],              # [b, s_q, h_q, d]
+                KV_fp8,                 # [num_blocks, block_size, h_kv, d]
+                d_v,                    # int: head_size_v
+                cache_seqlens,          # [b]: seqlens_k
+                data['block_table'],    # [b, max_blocks]
+                1.0 / (d_qk ** 0.5),   # float: softmax_scale
+                False,                  # bool: is_causal
+                tile_scheduler_metadata,  # from metadata call
+                num_splits,             # from metadata call
+                True,                   # bool: is_fp8
+                data['indices']         # optional [b, s_q, topk]
             )
             torch.cuda.synchronize()
             elapsed = time.time() - start
+
+            output = result[0]
+            lse = result[1]
 
             return {
                 'output': output.cpu().numpy(),
@@ -296,22 +312,34 @@ def test_flashmla_prefill(config):
     h_q = config['num_heads_q']
     h_kv = config.get('num_heads_kv', 1)
     d_v = config['head_dim_v']
+    d_qk = config['head_dim_qk']
     topk = config['topk']
 
     with torch.no_grad():
         try:
-            output = torch.zeros(b, s_q, h_q, d_v, dtype=torch.bfloat16, device='cuda')
-            lse = torch.zeros(b, s_q, h_q, dtype=torch.float32, device='cuda')
-            max_logits = torch.zeros(b, s_q, h_q, dtype=torch.float32, device='cuda')
-
-            torch.cuda.synchronize()  # Ensure previous ops complete
+            # Prefill API is unbatched - process each batch element separately
+            torch.cuda.synchronize()
             start = time.time()
-            sparse_prefill_fwd(
-                data['Q'], data['KV'], data['indices'],
-                output, max_logits, lse,
-                0.08838834764831845,  # sm_scale
-                0.08838834764831845 / np.log(2),  # sm_scale_div_log2
-            )
+
+            results = []
+            for i in range(b):
+                q_batch = data['Q'][i]  # [s_q, h_q, d_qk]
+                kv_batch = data['KV'][i]  # [s_kv, h_kv, d_qk]
+                indices_batch = data['indices'][i]  # [s_q, h_kv, topk]
+
+                # Returns tuple (output, max_logits, lse)
+                result = sparse_prefill_fwd(
+                    q_batch, kv_batch, indices_batch,
+                    1.0 / (d_qk ** 0.5),  # sm_scale
+                    d_v
+                )
+                results.append(result)
+
+            # Stack batch outputs
+            output = torch.stack([r[0] for r in results], dim=0)
+            max_logits = torch.stack([r[1] for r in results], dim=0)
+            lse = torch.stack([r[2] for r in results], dim=0)
+
             torch.cuda.synchronize()
             elapsed = time.time() - start
 
@@ -346,7 +374,9 @@ def test_deepgemm(config):
     print(f"  Testing DeepGEMM: {config['name']}")
 
     try:
-        from deep_gemm.impls.sm100_fp8_paged_mqa_logits import sm100_fp8_paged_mqa_logits
+        import deep_gemm
+        fp8_paged_mqa_logits = deep_gemm.fp8_paged_mqa_logits
+        get_metadata = deep_gemm.get_paged_mqa_logits_metadata
     except Exception as e:
         return {'error': f'Failed to load DeepGEMM: {e}'}
 
@@ -354,7 +384,7 @@ def test_deepgemm(config):
     b = config['batch_size']
     h_q = config['num_heads_q']
     d = config['head_dim_qk']
-    max_seqlen = config.get('max_seqlen', 2048)
+    max_context_len = config.get('max_seqlen', 2048)
     topk = config['topk']
 
     torch.manual_seed(RANDOM_SEED + deterministic_hash(config['name']) % 1000)
@@ -368,26 +398,25 @@ def test_deepgemm(config):
             num_blocks = 32
             block_size = 64
             KV = torch.randn(num_blocks, block_size, d, dtype=torch.bfloat16, device='cuda') * 0.1
-            KV_fp8 = KV.to(torch.float8_e4m3fn)  # Convert BF16 to FP8
-            scale = torch.tensor([0.01], dtype=torch.float32, device='cuda')
+            KV_fp8 = KV.to(torch.float8_e4m3fn)
+            weights = torch.full((1,), 0.01, dtype=torch.float32, device='cuda')  # FP8 scales
 
-            # Indices: (b, topk)
-            indices = torch.randint(0, num_blocks * block_size, (b, topk), dtype=torch.int32, device='cuda')
-            indices = indices.sort(dim=1)[0]
+            # Context lens (actual sequence lengths, not indices)
+            context_lens = torch.randint(topk, num_blocks * block_size, (b,), dtype=torch.int32, device='cuda')
 
             # Block table
             block_table = torch.arange(num_blocks, dtype=torch.int32, device='cuda').unsqueeze(0).expand(b, -1)
 
-            # Output
-            logits = torch.zeros(b, topk, dtype=torch.bfloat16, device='cuda')
+            # Get schedule metadata
+            schedule_meta = get_metadata(context_lens, block_size, 108)  # num_sms
 
-            torch.cuda.synchronize()  # Ensure previous ops complete
+            torch.cuda.synchronize()
             start = time.time()
-            sm100_fp8_paged_mqa_logits(
-                Q, KV_fp8, indices, block_table,
-                logits,
-                scale, scale,
-                0.08838834764831845,  # sm_scale
+            logits = fp8_paged_mqa_logits(
+                Q, KV_fp8, weights,
+                context_lens, block_table, schedule_meta,
+                max_context_len,
+                False  # clean_logits
             )
             torch.cuda.synchronize()
             elapsed = time.time() - start
@@ -446,65 +475,65 @@ def main():
     # Define test configurations
     if args.quick:
         decode_configs = [
-            {'name': 'small', 'batch_size': 1, 's_q': 1, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'decode'},
+            {'name': 'small', 'batch_size': 1, 's_q': 1, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode'},
         ]
         prefill_configs = [
-            {'name': 'small', 'batch_size': 1, 's_q': 4, 's_kv': 128, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'prefill'},
+            {'name': 'small', 'batch_size': 1, 's_q': 4, 's_kv': 128, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 128, 'mode': 'prefill'},
         ]
         deepgemm_configs = [
-            {'name': 'small', 'batch_size': 1, 'num_heads_q': 32, 'head_dim_qk': 128, 'topk': 32},
+            {'name': 'small', 'batch_size': 1, 'num_heads_q': 32, 'head_dim_qk': 128, 'topk': 128},
         ]
         edge_case_configs = []
         mixed_precision_configs = []
     else:
         decode_configs = [
-            # Small: single batch, minimal tokens
-            {'name': 'small_single', 'batch_size': 1, 's_q': 1, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'decode'},
+            # Small: single batch, minimal tokens (topk must be multiple of 128 for SM90, head_dim_qk=576 for MLA)
+            {'name': 'small_single', 'batch_size': 1, 's_q': 1, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode'},
             # Medium: multi-batch, standard config
-            {'name': 'medium_multi', 'batch_size': 4, 's_q': 2, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 64, 'mode': 'decode'},
+            {'name': 'medium_multi', 'batch_size': 4, 's_q': 2, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode'},
             # Large: many query tokens (critical for s_q > 1 bug)
-            {'name': 'large_s_q', 'batch_size': 2, 's_q': 8, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 64, 'mode': 'decode'},
+            {'name': 'large_s_q', 'batch_size': 2, 's_q': 8, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode'},
             # DeepSeek V3 config
-            {'name': 'deepseek_v3', 'batch_size': 1, 's_q': 1, 'num_heads_q': 128, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode'},
+            {'name': 'deepseek_v3', 'batch_size': 1, 's_q': 1, 's_kv': 1024, 'num_heads_q': 128, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 256, 'mode': 'decode'},
         ]
 
         prefill_configs = [
-            # Small: single batch, few queries
-            {'name': 'small_single', 'batch_size': 1, 's_q': 4, 's_kv': 128, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'prefill'},
+            # Small: single batch, few queries (topk must be multiple of 128 for SM90, s_kv must be >= topk)
+            {'name': 'small_single', 'batch_size': 1, 's_q': 4, 's_kv': 256, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 128, 'mode': 'prefill'},
             # Medium: multi-batch
-            {'name': 'medium_multi', 'batch_size': 4, 's_q': 8, 's_kv': 256, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 64, 'mode': 'prefill'},
+            {'name': 'medium_multi', 'batch_size': 4, 's_q': 8, 's_kv': 512, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 256, 'mode': 'prefill'},
             # Long sequence
-            {'name': 'long_seq', 'batch_size': 1, 's_q': 4, 's_kv': 2048, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 128, 'mode': 'prefill'},
+            {'name': 'long_seq', 'batch_size': 1, 's_q': 4, 's_kv': 2048, 'num_heads_q': 32, 'num_heads_kv': 1, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 384, 'mode': 'prefill'},
         ]
 
         deepgemm_configs = [
-            # Small
-            {'name': 'small', 'batch_size': 1, 'num_heads_q': 32, 'head_dim_qk': 128, 'topk': 32},
+            # Small (topk must be multiple of 128 for SM90)
+            {'name': 'small', 'batch_size': 1, 'num_heads_q': 32, 'head_dim_qk': 128, 'topk': 128},
             # Medium
-            {'name': 'medium', 'batch_size': 4, 'num_heads_q': 32, 'head_dim_qk': 128, 'topk': 64},
+            {'name': 'medium', 'batch_size': 4, 'num_heads_q': 32, 'head_dim_qk': 128, 'topk': 256},
             # DeepSeek V3
-            {'name': 'deepseek_v3', 'batch_size': 1, 'num_heads_q': 128, 'head_dim_qk': 128, 'topk': 128},
+            {'name': 'deepseek_v3', 'batch_size': 1, 'num_heads_q': 128, 'head_dim_qk': 128, 'topk': 512},
         ]
 
-        # Edge case configurations (special indices patterns)
+        # Edge case configurations (special indices patterns, head_dim_qk=576 for MLA)
         edge_case_configs = [
             # All -1 indices (no valid tokens)
-            {'name': 'edge_all_negative', 'batch_size': 2, 's_q': 2, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'decode', 'indices_pattern': 'all_negative'},
+            {'name': 'edge_all_negative', 'batch_size': 2, 's_q': 2, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode', 'indices_pattern': 'all_negative'},
             # Single valid token (rest -1)
-            {'name': 'edge_single_valid', 'batch_size': 2, 's_q': 2, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'decode', 'indices_pattern': 'single_valid'},
+            {'name': 'edge_single_valid', 'batch_size': 2, 's_q': 2, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode', 'indices_pattern': 'single_valid'},
             # Sparse realistic (80% valid, 20% -1)
-            {'name': 'edge_sparse_80', 'batch_size': 2, 's_q': 2, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 64, 'mode': 'decode', 'indices_pattern': 'sparse_80'},
+            {'name': 'edge_sparse_80', 'batch_size': 2, 's_q': 2, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode', 'indices_pattern': 'sparse_80'},
             # All same index (degenerate attention to single token)
-            {'name': 'edge_all_same', 'batch_size': 2, 's_q': 2, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'decode', 'indices_pattern': 'all_same'},
+            {'name': 'edge_all_same', 'batch_size': 2, 's_q': 2, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode', 'indices_pattern': 'all_same'},
         ]
 
-        # Mixed precision configurations (BF16 vs FP8 paths)
+        # Mixed precision configurations (BF16 vs FP8 paths, head_dim_qk=576 for MLA)
         mixed_precision_configs = [
             # BF16 path (non-quantized KV)
-            {'name': 'precision_bf16', 'batch_size': 2, 's_q': 2, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'decode', 'precision': 'bf16'},
+            {'name': 'precision_bf16', 'batch_size': 2, 's_q': 2, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode', 'precision': 'bf16'},
             # FP8 path with different scales
-            {'name': 'precision_fp8_small_scale', 'batch_size': 2, 's_q': 2, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'decode', 'precision': 'fp8', 'fp8_scale': 0.001},
-            {'name': 'precision_fp8_large_scale', 'batch_size': 2, 's_q': 2, 'num_heads_q': 32, 'head_dim_qk': 128, 'head_dim_v': 512, 'topk': 32, 'mode': 'decode', 'precision': 'fp8', 'fp8_scale': 0.1},
+            {'name': 'precision_fp8_small_scale', 'batch_size': 2, 's_q': 2, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode', 'precision': 'fp8', 'fp8_scale': 0.001},
+            {'name': 'precision_fp8_large_scale', 'batch_size': 2, 's_q': 2, 's_kv': 512, 'num_heads_q': 32, 'head_dim_qk': 576, 'head_dim_v': 512, 'topk': 128, 'mode': 'decode', 'precision': 'fp8', 'fp8_scale': 0.1},
         ]
 
     # Test FlashMLA Decode
