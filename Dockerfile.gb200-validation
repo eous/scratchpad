@@ -67,8 +67,9 @@ RUN git clone --recursive -b sm100-validation https://github.com/eous/DeepGEMM.g
 
 # Download validation script from scratchpad
 # Cache busts when SCRIPT_VERSION ARG changes
+# Adds timestamp to URL to bypass GitHub CDN cache
 RUN echo "Downloading script version: ${SCRIPT_VERSION}" && \
-    wget https://raw.githubusercontent.com/eous/scratchpad/main/generate_sm100_reference.py -O /workspace/generate_sm100_reference.py && \
+    wget "https://raw.githubusercontent.com/eous/scratchpad/main/generate_sm100_reference.py?cache_bust=${SCRIPT_VERSION}_$(date +%s)" -O /workspace/generate_sm100_reference.py && \
     chmod +x /workspace/generate_sm100_reference.py && \
     echo "Script SHA256: $(sha256sum /workspace/generate_sm100_reference.py | cut -d' ' -f1)"
 
