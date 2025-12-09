@@ -26,12 +26,40 @@ import json
 import time
 import argparse
 import sys
+import hashlib
+import traceback
 from pathlib import Path
 
 # Fixed random seed for reproducibility across SM100/SM120
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
+
+def validate_environment():
+    """Validate that we're on a CUDA-capable machine"""
+    if not torch.cuda.is_available():
+        print("ERROR: CUDA is not available. This script requires a GPU.")
+        sys.exit(1)
+
+    device_count = torch.cuda.device_count()
+    if device_count == 0:
+        print("ERROR: No CUDA devices found.")
+        sys.exit(1)
+
+    # Verify we can allocate on GPU
+    try:
+        test = torch.zeros(1, device='cuda')
+        torch.cuda.synchronize()
+        del test
+    except RuntimeError as e:
+        print(f"ERROR: Cannot allocate CUDA memory: {e}")
+        sys.exit(1)
+
+    return True
+
+def deterministic_hash(s: str) -> int:
+    """Compute a deterministic hash consistent across Python runs"""
+    return int(hashlib.md5(s.encode()).hexdigest(), 16)
 
 def get_system_info():
     """Collect system information for reference"""
@@ -57,15 +85,14 @@ def quantize_fp8(tensor, scale=None):
     """Quantize tensor to FP8 E4M3 format"""
     if scale is None:
         # Compute scale from tensor statistics
-        amax = tensor.abs().max()
+        amax = tensor.abs().max().item()  # Extract scalar value
         scale = amax / 448.0  # FP8 E4M3 max representable value
         scale = max(scale, 1e-12)  # Avoid division by zero
 
     # Quantize
     scaled = tensor / scale
-    # Clamp to FP8 range and round
-    fp8_tensor = torch.clamp(scaled, -448.0, 448.0)
-    fp8_tensor = fp8_tensor.to(torch.float8_e4m3fn)
+    # Clamp to FP8 range and convert
+    fp8_tensor = torch.clamp(scaled, -448.0, 448.0).to(torch.float8_e4m3fn)
 
     return fp8_tensor, scale
 
@@ -80,8 +107,11 @@ def generate_test_data(config):
     d_v = config['head_dim_v']
     topk = config['topk']
 
-    # Generate Q, K, V with specific seed for this config
-    seed_offset = hash(str(config)) % 1000
+    # Initialize block_table (only used for decode mode)
+    block_table = None
+
+    # Generate Q, K, V with specific seed for this config (deterministic hash)
+    seed_offset = deterministic_hash(str(config)) % 1000
     torch.manual_seed(RANDOM_SEED + seed_offset)
 
     if 'prefill' in config.get('mode', 'decode'):
@@ -145,41 +175,20 @@ def generate_test_data(config):
         'Q': Q,
         'KV': KV,
         'indices': indices,
-        'block_table': block_table if 'decode' in config.get('mode', 'decode') else None,
+        'block_table': block_table,  # None for prefill, tensor for decode
     }
 
-def find_library(name):
-    """Auto-discover library path"""
-    from glob import glob
-
-    # Common locations
-    search_paths = [
-        '/usr/local/lib/python3.12/dist-packages/vllm/',
-        '/usr/local/lib/python3.*/dist-packages/vllm/',
-        './',
-        '/workspace/vllm/docker/FlashMLA/',
-        '/workspace/FlashMLA/',
-    ]
-
-    for pattern in search_paths:
-        matches = glob(f'{pattern}{name}*.so')
-        if matches:
-            return matches[0]
-
-    raise FileNotFoundError(f"Could not find {name} library in common locations")
+# API functions removed - using official repo APIs directly in test functions
 
 def test_flashmla_decode(config):
     """Test FlashMLA decode kernel and capture outputs"""
     print(f"  Testing FlashMLA Decode: {config['name']}")
 
     try:
-        # Load library (auto-discover path)
-        lib_path = find_library('_flashmla_C')
-        torch.ops.load_library(lib_path)
         fwd_kvcache_mla = torch.ops._flashmla_C.fwd_kvcache_mla
         get_mla_metadata = torch.ops._flashmla_C.get_mla_decoding_metadata
     except Exception as e:
-        return {'error': f'Failed to load library: {e}'}
+        return {'error': f'Failed to load FlashMLA: {e}'}
 
     # Generate test data
     data = generate_test_data(config)
@@ -207,76 +216,76 @@ def test_flashmla_decode(config):
     s_q = config.get('s_q', 1)
     topk = config['topk']
 
-    try:
-        cache_lens = torch.full((b,), 4096, dtype=torch.int32, device='cuda')
-        metadata = get_mla_metadata(
-            b, s_q, topk,
-            cache_lens,
-            64,  # block_size
-            0,   # fixed_overhead
-            1    # num_sm_parts
-        )
+    with torch.no_grad():
+        try:
+            cache_lens = torch.full((b,), 4096, dtype=torch.int32, device='cuda')
+            metadata = get_mla_metadata(
+                b, s_q, topk,
+                cache_lens,
+                64,  # block_size
+                0,   # fixed_overhead
+                1    # num_sm_parts
+            )
 
-        # Run kernel
-        output = torch.zeros(
-            b, s_q, config['num_heads_q'], config['head_dim_v'],
-            dtype=torch.bfloat16, device='cuda'
-        )
-        lse = torch.zeros(
-            b, s_q, config['num_heads_q'],
-            dtype=torch.float32, device='cuda'
-        )
+            # Run kernel
+            output = torch.zeros(
+                b, s_q, config['num_heads_q'], config['head_dim_v'],
+                dtype=torch.bfloat16, device='cuda'
+            )
+            lse = torch.zeros(
+                b, s_q, config['num_heads_q'],
+                dtype=torch.float32, device='cuda'
+            )
 
-        start = time.time()
-        fwd_kvcache_mla(
-            data['Q'], KV_fp8, data['indices'], data['block_table'],
-            output, lse,
-            metadata['tile_scheduler_metadata'],
-            metadata['num_splits'],
-            metadata['total_num_splits'],
-            None, None,  # split accumulators
-            scale, scale,
-            0.08838834764831845,  # sm_scale for d_qk=128
-            0.08838834764831845 / np.log(2),  # sm_scale_log2
-        )
-        torch.cuda.synchronize()
-        elapsed = time.time() - start
+            torch.cuda.synchronize()  # Ensure previous ops complete
+            start = time.time()
+            fwd_kvcache_mla(
+                data['Q'], KV_fp8, data['indices'], data['block_table'],
+                output, lse,
+                metadata['tile_scheduler_metadata'],
+                metadata['num_splits'],
+                metadata['total_num_splits'],
+                None, None,  # split accumulators
+                scale, scale,
+                0.08838834764831845,  # sm_scale for d_qk=128
+                0.08838834764831845 / np.log(2),  # sm_scale_log2
+            )
+            torch.cuda.synchronize()
+            elapsed = time.time() - start
 
-        return {
-            'output': output.cpu().numpy(),
-            'lse': lse.cpu().numpy(),
-            'output_shape': list(output.shape),
-            'output_stats': {
-                'min': float(output.min().item()),
-                'max': float(output.max().item()),
-                'mean': float(output.mean().item()),
-                'std': float(output.std().item()),
-                'num_nan': int(torch.isnan(output).sum().item()),
-                'num_inf': int(torch.isinf(output).sum().item()),
-            },
-            'lse_stats': {
-                'min': float(lse.min().item()),
-                'max': float(lse.max().item()),
-                'mean': float(lse.mean().item()),
-                'num_nan': int(torch.isnan(lse).sum().item()),
-                'num_inf': int(torch.isinf(lse).sum().item()),
-            },
-            'time_ms': elapsed * 1000,
-            'success': True,
-        }
-    except Exception as e:
-        return {'error': str(e), 'success': False}
+            return {
+                'output': output.cpu().numpy(),
+                'lse': lse.cpu().numpy(),
+                'output_shape': list(output.shape),
+                'output_stats': {
+                    'min': float(output.min().item()),
+                    'max': float(output.max().item()),
+                    'mean': float(output.mean().item()),
+                    'std': float(output.std().item()),
+                    'num_nan': int(torch.isnan(output).sum().item()),
+                    'num_inf': int(torch.isinf(output).sum().item()),
+                },
+                'lse_stats': {
+                    'min': float(lse.min().item()),
+                    'max': float(lse.max().item()),
+                    'mean': float(lse.mean().item()),
+                    'num_nan': int(torch.isnan(lse).sum().item()),
+                    'num_inf': int(torch.isinf(lse).sum().item()),
+                },
+                'time_ms': elapsed * 1000,
+                'success': True,
+            }
+        except Exception as e:
+            return {'error': str(e), 'success': False}
 
 def test_flashmla_prefill(config):
     """Test FlashMLA prefill kernel and capture outputs"""
     print(f"  Testing FlashMLA Prefill: {config['name']}")
 
     try:
-        lib_path = find_library('_flashmla_C')
-        torch.ops.load_library(lib_path)
         sparse_prefill_fwd = torch.ops._flashmla_C.sparse_prefill_fwd
     except Exception as e:
-        return {'error': f'Failed to load library: {e}'}
+        return {'error': f'Failed to load FlashMLA: {e}'}
 
     # Generate test data
     data = generate_test_data(config)
@@ -289,53 +298,54 @@ def test_flashmla_prefill(config):
     d_v = config['head_dim_v']
     topk = config['topk']
 
-    try:
-        output = torch.zeros(b, s_q, h_q, d_v, dtype=torch.bfloat16, device='cuda')
-        lse = torch.zeros(b, s_q, h_q, dtype=torch.float32, device='cuda')
-        max_logits = torch.zeros(b, s_q, h_q, dtype=torch.float32, device='cuda')
+    with torch.no_grad():
+        try:
+            output = torch.zeros(b, s_q, h_q, d_v, dtype=torch.bfloat16, device='cuda')
+            lse = torch.zeros(b, s_q, h_q, dtype=torch.float32, device='cuda')
+            max_logits = torch.zeros(b, s_q, h_q, dtype=torch.float32, device='cuda')
 
-        start = time.time()
-        sparse_prefill_fwd(
-            data['Q'], data['KV'], data['indices'],
-            output, max_logits, lse,
-            0.08838834764831845,  # sm_scale
-            0.08838834764831845 / np.log(2),  # sm_scale_div_log2
-        )
-        torch.cuda.synchronize()
-        elapsed = time.time() - start
+            torch.cuda.synchronize()  # Ensure previous ops complete
+            start = time.time()
+            sparse_prefill_fwd(
+                data['Q'], data['KV'], data['indices'],
+                output, max_logits, lse,
+                0.08838834764831845,  # sm_scale
+                0.08838834764831845 / np.log(2),  # sm_scale_div_log2
+            )
+            torch.cuda.synchronize()
+            elapsed = time.time() - start
 
-        return {
-            'output': output.cpu().numpy(),
-            'lse': lse.cpu().numpy(),
-            'max_logits': max_logits.cpu().numpy(),
-            'output_shape': list(output.shape),
-            'output_stats': {
-                'min': float(output.min().item()),
-                'max': float(output.max().item()),
-                'mean': float(output.mean().item()),
-                'std': float(output.std().item()),
-                'num_nan': int(torch.isnan(output).sum().item()),
-                'num_inf': int(torch.isinf(output).sum().item()),
-            },
-            'lse_stats': {
-                'min': float(lse.min().item()),
-                'max': float(lse.max().item()),
-                'mean': float(lse.mean().item()),
-                'num_nan': int(torch.isnan(lse).sum().item()),
-                'num_inf': int(torch.isinf(lse).sum().item()),
-            },
-            'time_ms': elapsed * 1000,
-            'success': True,
-        }
-    except Exception as e:
-        return {'error': str(e), 'success': False}
+            return {
+                'output': output.cpu().numpy(),
+                'lse': lse.cpu().numpy(),
+                'max_logits': max_logits.cpu().numpy(),
+                'output_shape': list(output.shape),
+                'output_stats': {
+                    'min': float(output.min().item()),
+                    'max': float(output.max().item()),
+                    'mean': float(output.mean().item()),
+                    'std': float(output.std().item()),
+                    'num_nan': int(torch.isnan(output).sum().item()),
+                    'num_inf': int(torch.isinf(output).sum().item()),
+                },
+                'lse_stats': {
+                    'min': float(lse.min().item()),
+                    'max': float(lse.max().item()),
+                    'mean': float(lse.mean().item()),
+                    'num_nan': int(torch.isnan(lse).sum().item()),
+                    'num_inf': int(torch.isinf(lse).sum().item()),
+                },
+                'time_ms': elapsed * 1000,
+                'success': True,
+            }
+        except Exception as e:
+            return {'error': str(e), 'success': False}
 
 def test_deepgemm(config):
     """Test DeepGEMM MQA logits kernel and capture outputs"""
     print(f"  Testing DeepGEMM: {config['name']}")
 
     try:
-        import deep_gemm
         from deep_gemm.impls.sm100_fp8_paged_mqa_logits import sm100_fp8_paged_mqa_logits
     except Exception as e:
         return {'error': f'Failed to load DeepGEMM: {e}'}
@@ -347,54 +357,57 @@ def test_deepgemm(config):
     max_seqlen = config.get('max_seqlen', 2048)
     topk = config['topk']
 
-    torch.manual_seed(RANDOM_SEED + hash(config['name']) % 1000)
+    torch.manual_seed(RANDOM_SEED + deterministic_hash(config['name']) % 1000)
 
-    try:
-        # Q: (b, h_q, d)
-        Q = torch.randn(b, h_q, d, dtype=torch.bfloat16, device='cuda') * 0.1
+    with torch.no_grad():
+        try:
+            # Q: (b, h_q, d)
+            Q = torch.randn(b, h_q, d, dtype=torch.bfloat16, device='cuda') * 0.1
 
-        # KV cache (FP8): (num_blocks, block_size, d)
-        num_blocks = 32
-        block_size = 64
-        KV_fp8 = torch.randn(num_blocks, block_size, d, dtype=torch.float8_e4m3fn, device='cuda')
-        scale = torch.tensor([0.01], dtype=torch.float32, device='cuda')
+            # KV cache (FP8): (num_blocks, block_size, d)
+            num_blocks = 32
+            block_size = 64
+            KV = torch.randn(num_blocks, block_size, d, dtype=torch.bfloat16, device='cuda') * 0.1
+            KV_fp8 = KV.to(torch.float8_e4m3fn)  # Convert BF16 to FP8
+            scale = torch.tensor([0.01], dtype=torch.float32, device='cuda')
 
-        # Indices: (b, topk)
-        indices = torch.randint(0, num_blocks * block_size, (b, topk), dtype=torch.int32, device='cuda')
-        indices = indices.sort(dim=1)[0]
+            # Indices: (b, topk)
+            indices = torch.randint(0, num_blocks * block_size, (b, topk), dtype=torch.int32, device='cuda')
+            indices = indices.sort(dim=1)[0]
 
-        # Block table
-        block_table = torch.arange(num_blocks, dtype=torch.int32, device='cuda').unsqueeze(0).expand(b, -1)
+            # Block table
+            block_table = torch.arange(num_blocks, dtype=torch.int32, device='cuda').unsqueeze(0).expand(b, -1)
 
-        # Output
-        logits = torch.zeros(b, topk, dtype=torch.bfloat16, device='cuda')
+            # Output
+            logits = torch.zeros(b, topk, dtype=torch.bfloat16, device='cuda')
 
-        start = time.time()
-        sm100_fp8_paged_mqa_logits(
-            Q, KV_fp8, indices, block_table,
-            logits,
-            scale, scale,
-            0.08838834764831845,  # sm_scale
-        )
-        torch.cuda.synchronize()
-        elapsed = time.time() - start
+            torch.cuda.synchronize()  # Ensure previous ops complete
+            start = time.time()
+            sm100_fp8_paged_mqa_logits(
+                Q, KV_fp8, indices, block_table,
+                logits,
+                scale, scale,
+                0.08838834764831845,  # sm_scale
+            )
+            torch.cuda.synchronize()
+            elapsed = time.time() - start
 
-        return {
-            'logits': logits.cpu().numpy(),
-            'logits_shape': list(logits.shape),
-            'logits_stats': {
-                'min': float(logits.min().item()),
-                'max': float(logits.max().item()),
-                'mean': float(logits.mean().item()),
-                'std': float(logits.std().item()),
-                'num_nan': int(torch.isnan(logits).sum().item()),
-                'num_inf': int(torch.isinf(logits).sum().item()),
-            },
-            'time_ms': elapsed * 1000,
-            'success': True,
-        }
-    except Exception as e:
-        return {'error': str(e), 'success': False}
+            return {
+                'logits': logits.cpu().numpy(),
+                'logits_shape': list(logits.shape),
+                'logits_stats': {
+                    'min': float(logits.min().item()),
+                    'max': float(logits.max().item()),
+                    'mean': float(logits.mean().item()),
+                    'std': float(logits.std().item()),
+                    'num_nan': int(torch.isnan(logits).sum().item()),
+                    'num_inf': int(torch.isinf(logits).sum().item()),
+                },
+                'time_ms': elapsed * 1000,
+                'success': True,
+            }
+        except Exception as e:
+            return {'error': str(e), 'success': False}
 
 def main():
     parser = argparse.ArgumentParser(description='Generate SM100 reference outputs')
@@ -408,8 +421,13 @@ def main():
     print("SM100 Reference Output Generator")
     print("=" * 80)
 
+    # Validate CUDA environment
+    print("\n[Validating CUDA environment...]")
+    validate_environment()
+    print("  ✓ CUDA available and working")
+
     # Collect system info
-    print("\n[1/4] Collecting system information...")
+    print("\n[1/6] Collecting system information...")
     system_info = get_system_info()
     print(f"  GPU: {system_info['gpu_name']}")
     print(f"  Compute Capability: {system_info['gpu_compute_capability']}")
@@ -490,7 +508,7 @@ def main():
         ]
 
     # Test FlashMLA Decode
-    print("\n[2/4] Testing FlashMLA Decode kernels...")
+    print("\n[2/6] Testing FlashMLA Decode kernels...")
     for config in decode_configs:
         result = test_flashmla_decode(config)
         results['flashmla_decode'][config['name']] = result
@@ -500,7 +518,7 @@ def main():
             print(f"    ✗ {config['name']}: {result.get('error', 'unknown error')}")
 
     # Test FlashMLA Prefill
-    print("\n[3/4] Testing FlashMLA Prefill kernels...")
+    print("\n[3/6] Testing FlashMLA Prefill kernels...")
     for config in prefill_configs:
         result = test_flashmla_prefill(config)
         results['flashmla_prefill'][config['name']] = result
@@ -544,11 +562,14 @@ def main():
 
     # Save results
     print(f"\n[DONE] Saving results to {args.output}...")
-    with open(args.output, 'wb') as f:
-        pickle.dump(results, f)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, 'wb') as f:
+        pickle.dump(results, f, protocol=4)  # Protocol 4 for compatibility
 
     # Also save human-readable summary
-    summary_path = Path(args.output).with_suffix('.json')
+    summary_path = output_path.with_suffix('.json')
     summary = {
         'system_info': system_info,
         'summary': {
@@ -560,7 +581,19 @@ def main():
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
 
-    print(f"Results saved to:")
+    # Verify saved files
+    print(f"\n[Verifying saved files...]")
+    try:
+        with open(output_path, 'rb') as f:
+            verify_results = pickle.load(f)
+        assert verify_results['random_seed'] == RANDOM_SEED
+        print(f"  ✓ Verified {output_path.name} ({output_path.stat().st_size / 1024 / 1024:.1f} MB)")
+        print(f"  ✓ Verified {summary_path.name} ({summary_path.stat().st_size / 1024:.1f} KB)")
+    except Exception as e:
+        print(f"  ✗ ERROR: Failed to verify output: {e}")
+        sys.exit(1)
+
+    print(f"\nResults saved to:")
     print(f"  - {args.output} (full data with arrays)")
     print(f"  - {summary_path} (human-readable summary)")
 
@@ -570,4 +603,27 @@ def main():
     print("=" * 80)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        print("\n" + "=" * 80)
+        print("FATAL ERROR - Script failed!")
+        print("=" * 80)
+        print(f"\nError: {e}\n")
+        traceback.print_exc()
+
+        # Try to save error log
+        try:
+            print("\nAttempting to save error log...")
+            with open('error_log.txt', 'w') as f:
+                f.write(f"Fatal error during SM100 reference generation\n")
+                f.write(f"Error: {e}\n\n")
+                f.write(traceback.format_exc())
+            print("  ✓ Error log saved to error_log.txt")
+        except:
+            pass
+
+        sys.exit(1)
