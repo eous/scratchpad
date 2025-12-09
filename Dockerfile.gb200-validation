@@ -1,8 +1,11 @@
 # Dockerfile for GB200 SM100 Reference Generation
 # Self-contained validation environment using official repos
 #
-# Build:
+# Build (normal):
 #   docker build -f Dockerfile.gb200-validation -t gb200-validation .
+#
+# Build with cache-busting (force fresh script download):
+#   docker build --build-arg SCRIPT_VERSION=v6 -f Dockerfile.gb200-validation -t gb200-validation .
 #
 # Run:
 #   docker run --gpus all -v $(pwd)/output:/output gb200-validation
@@ -46,6 +49,10 @@ ENV CMAKE_BUILD_PARALLEL_LEVEL=128
 
 WORKDIR /workspace
 
+# Cache-busting ARG for script download layer
+ARG SCRIPT_VERSION=v5
+ENV SCRIPT_VERSION=${SCRIPT_VERSION}
+
 # Clone and build FlashMLA from sm100-validation branch
 RUN git clone --recursive -b sm100-validation https://github.com/eous/FlashMLA.git && \
     cd FlashMLA && \
@@ -59,9 +66,11 @@ RUN git clone --recursive -b sm100-validation https://github.com/eous/DeepGEMM.g
     echo "DeepGEMM build complete"
 
 # Download validation script from scratchpad
-# Version: v5 (topk%128==0, head_dim_qk=576, s_kv>=topk, num_heads_q%64==0)
-RUN wget https://raw.githubusercontent.com/eous/scratchpad/main/generate_sm100_reference.py -O /workspace/generate_sm100_reference.py && \
-    chmod +x /workspace/generate_sm100_reference.py
+# Cache busts when SCRIPT_VERSION ARG changes
+RUN echo "Downloading script version: ${SCRIPT_VERSION}" && \
+    wget https://raw.githubusercontent.com/eous/scratchpad/main/generate_sm100_reference.py -O /workspace/generate_sm100_reference.py && \
+    chmod +x /workspace/generate_sm100_reference.py && \
+    echo "Script SHA256: $(sha256sum /workspace/generate_sm100_reference.py | cut -d' ' -f1)"
 
 # Create output directory
 RUN mkdir -p /output
