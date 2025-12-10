@@ -29,6 +29,11 @@ import sys
 import hashlib
 import traceback
 from pathlib import Path
+import os
+
+# Force synchronous CUDA execution to avoid races
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+print("CUDA_LAUNCH_BLOCKING=1 (forced synchronous execution)")
 
 # Load FlashMLA torch ops (required for torch.ops._flashmla_C to work)
 # The TORCH_LIBRARY registration only runs when the module is imported
@@ -256,6 +261,8 @@ def test_flashmla_decode(config):
             )
             tile_scheduler_metadata = metadata[0]
             num_splits = metadata[1]
+            torch.cuda.synchronize()  # Ensure metadata is ready
+            torch.cuda.empty_cache()  # Clear cache
 
             # Run kernel - returns [output, lse]
             torch.cuda.synchronize()  # Ensure previous ops complete
@@ -278,6 +285,8 @@ def test_flashmla_decode(config):
 
             output = result[0]
             lse = result[1]
+            torch.cuda.synchronize()  # Ensure result tensors are written
+            torch.cuda.empty_cache()  # Clear cache
 
             return {
                 'output': output.cpu().numpy(),
@@ -329,6 +338,7 @@ def test_flashmla_prefill(config):
         try:
             # Prefill API is unbatched - process each batch element separately
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()  # Clear cache
             start = time.time()
 
             results = []
@@ -343,12 +353,16 @@ def test_flashmla_prefill(config):
                     1.0 / (d_qk ** 0.5),  # sm_scale
                     d_v
                 )
+                torch.cuda.synchronize()  # Sync after each batch
                 results.append(result)
+
+            torch.cuda.synchronize()  # Final sync before stacking
 
             # Stack batch outputs
             output = torch.stack([r[0] for r in results], dim=0)
             max_logits = torch.stack([r[1] for r in results], dim=0)
             lse = torch.stack([r[2] for r in results], dim=0)
+            torch.cuda.synchronize()  # Sync after stacking
 
             torch.cuda.synchronize()
             elapsed = time.time() - start
@@ -548,9 +562,13 @@ def main():
 
     # Test FlashMLA Decode
     print("\n[2/6] Testing FlashMLA Decode kernels...")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
     for config in decode_configs:
         result = test_flashmla_decode(config)
         results['flashmla_decode'][config['name']] = result
+        torch.cuda.synchronize()  # Sync after each test
         if result.get('success'):
             print(f"    ✓ {config['name']}: {result['output_stats']['mean']:.6f} mean, {result['time_ms']:.2f}ms")
         else:
@@ -558,9 +576,13 @@ def main():
 
     # Test FlashMLA Prefill
     print("\n[3/6] Testing FlashMLA Prefill kernels...")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
     for config in prefill_configs:
         result = test_flashmla_prefill(config)
         results['flashmla_prefill'][config['name']] = result
+        torch.cuda.synchronize()  # Sync after each test
         if result.get('success'):
             print(f"    ✓ {config['name']}: {result['output_stats']['mean']:.6f} mean, {result['time_ms']:.2f}ms")
         else:
@@ -568,9 +590,12 @@ def main():
 
     # Test DeepGEMM
     print("\n[4/6] Testing DeepGEMM kernels...")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     for config in deepgemm_configs:
         result = test_deepgemm(config)
         results['deepgemm'][config['name']] = result
+        torch.cuda.synchronize()  # Sync after each test
         if result.get('success'):
             print(f"    ✓ {config['name']}: {result['logits_stats']['mean']:.6f} mean, {result['time_ms']:.2f}ms")
         else:
@@ -579,9 +604,13 @@ def main():
     # Test Edge Cases
     if edge_case_configs:
         print("\n[5/6] Testing Edge Case Indices...")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         for config in edge_case_configs:
             result = test_flashmla_decode(config)
             results['edge_cases'][config['name']] = result
+            torch.cuda.synchronize()  # Sync after each test
             if result.get('success'):
                 print(f"    ✓ {config['name']}: {result['output_stats']['mean']:.6f} mean, "
                       f"NaN={result['output_stats']['num_nan']}, {result['time_ms']:.2f}ms")
@@ -591,9 +620,13 @@ def main():
     # Test Mixed Precision
     if mixed_precision_configs:
         print("\n[6/6] Testing Mixed Precision Paths...")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         for config in mixed_precision_configs:
             result = test_flashmla_decode(config)
             results['mixed_precision'][config['name']] = result
+            torch.cuda.synchronize()  # Sync after each test
             if result.get('success'):
                 print(f"    ✓ {config['name']}: {result['output_stats']['mean']:.6f} mean, {result['time_ms']:.2f}ms")
             else:

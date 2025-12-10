@@ -1,0 +1,108 @@
+--- a/generate_sm100_reference.py
++++ b/generate_sm100_reference.py
+@@ -30,6 +30,11 @@ import hashlib
+ import traceback
+ from pathlib import Path
+
++# Force synchronous CUDA execution to avoid races
++import os
++os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
++print("CUDA_LAUNCH_BLOCKING=1 (forced synchronous execution)")
++
+ # Load FlashMLA torch ops (required for torch.ops._flashmla_C to work)
+ # The TORCH_LIBRARY registration only runs when the module is imported
+ try:
+@@ -256,6 +261,8 @@ def test_flashmla_decode(config):
+             )
+             tile_scheduler_metadata = metadata[0]
+             num_splits = metadata[1]
++            torch.cuda.synchronize()  # Ensure metadata is ready
++            torch.cuda.empty_cache()  # Clear cache
+
+             # Run kernel - returns [output, lse]
+             torch.cuda.synchronize()  # Ensure previous ops complete
+@@ -276,6 +283,8 @@ def test_flashmla_decode(config):
+             elapsed = time.time() - start
+
+             output = result[0]
++            torch.cuda.synchronize()  # Ensure result is written
++            del result  # Free immediately
+             lse = result[1]
+
+             return {
+@@ -326,6 +335,8 @@ def test_flashmla_prefill(config):
+     with torch.no_grad():
+         try:
+             start = time.time()
++            torch.cuda.synchronize()  # Ensure previous ops complete
++            torch.cuda.empty_cache()  # Clear cache
+             result = sparse_prefill_fwd(
+                 data['Q'],
+                 data['KV'],
+@@ -338,6 +349,7 @@ def test_flashmla_prefill(config):
+
+             output = result[0]
+             max_logits = result[1]
++            torch.cuda.synchronize()  # Ensure result is written
+             lse = result[2]
+
+             return {
+@@ -395,6 +407,8 @@ def test_deepgemm(config):
+
+     with torch.no_grad():
+         try:
++            torch.cuda.synchronize()  # Ensure previous ops complete
++            torch.cuda.empty_cache()  # Clear cache
+             start = time.time()
+             # Use DeepGEMM MLA logits kernel
+             # Expected signature from csrc/apis/attention.hpp
+@@ -537,6 +551,9 @@ def main():
+
+     # Test FlashMLA Decode
+     print("\n[2/6] Testing FlashMLA Decode kernels...")
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++
+     for config in decode_configs:
+         result = test_flashmla_decode(config)
+         results['flashmla_decode'][config['name']] = result
+@@ -546,6 +563,9 @@ def main():
+
+     # Test FlashMLA Prefill
+     print("\n[3/6] Testing FlashMLA Prefill kernels...")
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++
+     for config in prefill_configs:
+         result = test_flashmla_prefill(config)
+         results['flashmla_prefill'][config['name']] = result
+@@ -555,6 +575,9 @@ def main():
+
+     # Test DeepGEMM
+     print("\n[4/6] Testing DeepGEMM kernels...")
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++
+     for config in deepgemm_configs:
+         result = test_deepgemm(config)
+         results['deepgemm'][config['name']] = result
+@@ -564,6 +587,9 @@ def main():
+
+     # Test edge cases
+     print("\n[5/6] Testing Edge Case Indices...")
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++
+     for config in edge_case_configs:
+         if config['mode'] == 'decode':
+             result = test_flashmla_decode(config)
+@@ -577,6 +603,9 @@ def main():
+
+     # Test mixed precision
+     print("\n[6/6] Testing Mixed Precision Paths...")
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++
+     for config in mixed_precision_configs:
+         if config['mode'] == 'decode':
+             result = test_flashmla_decode(config)
