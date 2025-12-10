@@ -158,14 +158,17 @@ def generate_test_data(config):
         # Pack into bytes: FP8(512) + FP32(4) + BF16(64) = 512 + 16 + 128 = 656 bytes
         KV = torch.zeros(num_blocks, block_size, h_kv, 656, dtype=torch.uint8, device='cuda')
 
-        # Pack FP8 nope (512 bytes)
-        KV[:, :, :, :512] = nope_fp8.view(num_blocks, block_size, h_kv, 512).view(torch.uint8)
+        # Pack FP8 nope (512 bytes) - FP8 is 1 byte per element
+        nope_bytes = nope_fp8.reshape(num_blocks, block_size, h_kv, 512).view(torch.uint8)
+        KV[:, :, :, :512] = nope_bytes
 
-        # Pack scales (16 bytes)
-        KV[:, :, :, 512:528] = scales.view(num_blocks, block_size, h_kv, 16).view(torch.uint8)
+        # Pack scales (16 bytes) - 4 float32 = 4*4 = 16 bytes
+        scales_bytes = scales.view(torch.uint8).reshape(num_blocks, block_size, h_kv, 16)
+        KV[:, :, :, 512:528] = scales_bytes
 
-        # Pack BF16 rope (128 bytes)
-        KV[:, :, :, 528:656] = rope_data.view(num_blocks, block_size, h_kv, 128).view(torch.uint8)
+        # Pack BF16 rope (128 bytes) - 64 bfloat16 = 64*2 = 128 bytes
+        rope_bytes = rope_data.view(torch.uint8).reshape(num_blocks, block_size, h_kv, 128)
+        KV[:, :, :, 528:656] = rope_bytes
 
         # Generate sparse indices based on pattern
         indices = torch.zeros(b, s_q, topk, dtype=torch.int32, device='cuda')
